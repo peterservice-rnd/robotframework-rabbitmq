@@ -1,0 +1,3 @@
+amqp==1.4.9
+requests==2.12.4
+robotframework==3.0.1
