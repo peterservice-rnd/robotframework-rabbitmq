@@ -14,6 +14,10 @@ Installation
 pip install robotframework-rabbitmq
 ```
 
+## Documentation
+
+See keyword documentation for RabbitMq library on [GitHub](https://github.com/peterservice-rnd/robotframework-rabbitmq/tree/master/docs).
+
 Example
 ---
 ```robot
