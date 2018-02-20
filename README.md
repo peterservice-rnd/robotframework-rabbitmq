@@ -1,11 +1,11 @@
-# RobotFramework RabbitMq
+# RobotFramework RabbitMQ
 
 [![Build Status](https://travis-ci.org/peterservice-rnd/robotframework-rabbitmq.svg?branch=master)](https://travis-ci.org/peterservice-rnd/robotframework-rabbitmq)
 
 Short Description
 ---
 
-[Robot Framework](http://www.robotframework.org) library to for working with RabbitMQ.
+[Robot Framework](http://www.robotframework.org) library for working with RabbitMQ.
 
 Installation
 ---
@@ -16,7 +16,7 @@ pip install robotframework-rabbitmq
 
 ## Documentation
 
-See keyword documentation for RabbitMq library on [GitHub](https://github.com/peterservice-rnd/robotframework-rabbitmq/tree/master/docs).
+See keyword documentation for RabbitMQ library on [GitHub](https://github.com/peterservice-rnd/robotframework-rabbitmq/tree/master/docs).
 
 Example
 ---
