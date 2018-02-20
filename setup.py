@@ -38,6 +38,6 @@ setup(
     ],
     keywords='testing testautomation robotframework rabbitmq amqp',
     package_dir={'': 'src'},
-    py_modules=['RabbitMqLibrary'],
+    py_modules=['RabbitMq'],
     install_requires=requirements,
 )
