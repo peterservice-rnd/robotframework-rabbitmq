@@ -1102,7 +1102,7 @@ class RabbitMq(object):
         | 1 | {u'payload': u'message body 1', u'exchange': u'testExchange', u'routing_key': u'testQueue', u'payload_bytes': 14, u'message_count': 3, u'payload_encoding': u'string', u'redelivered': False, u'properties': []} |
         | ... |
         """
-        path = '/queues/{vhost}/{name}/get'.format(
+        path = '/queues/{vhost}/{name}'.format(
             vhost=self._quote_vhost(vhost), name=quote(queue_name))
         body = {"count": count, "requeue": requeue, "encoding": encoding}
         if truncate is not None:
