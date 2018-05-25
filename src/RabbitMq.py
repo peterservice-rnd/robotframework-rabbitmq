@@ -1074,7 +1074,7 @@ class RabbitMq(object):
         return response.json()
 
     def get_message(self, queue_name, count, requeue, encoding, truncate=None,
-                    vhost='%2F'):
+                    vhost='%2F', ackmode='ack_requeue_true'):
         """
         Get message from the queue.
 
@@ -1104,7 +1104,7 @@ class RabbitMq(object):
         """
         path = '/queues/{vhost}/{name}/get'.format(
             vhost=self._quote_vhost(vhost), name=quote(queue_name))
-        body = {"count": count, "requeue": requeue, "encoding": encoding}
+        body = {"count": count, "requeue": requeue, "encoding": encoding,"ackmode": ackmode }
         if truncate is not None:
             body["truncate"] = truncate
         response = requests.post(self._http_connection.url + path,
