@@ -44,8 +44,11 @@ class BlockedConnection(Connection):
     """
 
     def __init__(self, **kwargs):
-        """
-        Constructor arguments are supplemented with callbacks to register blocking events
+        """Constructor arguments are supplemented with
+        callbacks to register blocking events
+
+        Args:
+            kwargs: Arguments of the parent class "Connection"
         """
         self.add_callback(self.block, 'on_blocked', kwargs)
         self.add_callback(self.unblock, 'on_unblocked', kwargs)
@@ -215,7 +218,7 @@ class RabbitMq(object):
         _username_ - user name;\n
         _password_ - user password;\n
         _alias_ - connection alias;\n
-        _virtual_host_ - virtual host name;\n
+        _vhost_ - virtual host name;\n
 
         *Returns:*\n
         Current connection index.
@@ -240,7 +243,7 @@ class RabbitMq(object):
         which also returns the index of connection.\n
 
         *Args:*\n
-        _index_or_alias_ - connection index or alias;
+        _alias_ - connection alias;
 
         *Returns:*\n
         Index of previous connection.
@@ -1085,6 +1088,9 @@ class RabbitMq(object):
         _encoding_ - message encoding (auto, base64);\n
         _truncate_ - size of the message split (in bytes) in case it is greater than specified parameter (optional);\n
         _vhost_ - virtual host name (quoted with requests.utils.quote);\n
+        _ackmode_ - determines whether the messages will be removed from the queue.
+        If ackmode is ack_requeue_true or reject_requeue_true they will be requeued.
+        If ackmode is ack_requeue_false or reject_requeue_false they will be removed;\n
 
         *Returns:*\n
         List with information about returned messages in dictionary format.
@@ -1104,7 +1110,7 @@ class RabbitMq(object):
         """
         path = '/queues/{vhost}/{name}/get'.format(
             vhost=self._quote_vhost(vhost), name=quote(queue_name))
-        body = {"count": count, "requeue": requeue, "encoding": encoding,"ackmode": ackmode }
+        body = {"count": count, "requeue": requeue, "encoding": encoding, "ackmode": ackmode}
         if truncate is not None:
             body["truncate"] = truncate
         response = requests.post(self._http_connection.url + path,
