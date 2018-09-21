@@ -2,13 +2,12 @@
 
 import json
 import requests
+import pika
+from pika.exceptions import ChannelClosed, IncompatibleProtocolError
 from requests.utils import quote
 from robot.api import logger
 from robot.utils import ConnectionCache
-from amqp.connection import Connection
-from amqp.basic_message import Message
-from amqp.exceptions import NotFound
-from socket import gaierror, error, timeout
+from socket import gaierror, error
 from robot.libraries.BuiltIn import BuiltIn
 
 
@@ -37,53 +36,40 @@ class RequestConnection(object):
         pass
 
 
-class BlockedConnection(Connection):
+class BlockedConnection(pika.BlockingConnection):
     """
     Wrapper over standard connection to RabbitMQ
     Allows to register connection lock events of the server
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, parameters=None, impl_class=None):
         """Constructor arguments are supplemented with
         callbacks to register blocking events
 
         Args:
-            kwargs: Arguments of the parent class "Connection"
+            parameters: connection parameters instance or non-empty sequence of them;
+            impl_class: implementation class (for test/debugging only).
         """
-        self.add_callback(self.block, 'on_blocked', kwargs)
-        self.add_callback(self.unblock, 'on_unblocked', kwargs)
-        super(BlockedConnection, self).__init__(**kwargs)
+        super(BlockedConnection, self).__init__(parameters=parameters, _impl_class=impl_class)
+        self.add_on_connection_blocked_callback(self.on_blocked)
+        self.add_on_connection_unblocked_callback(self.on_unblocked)
         self._blocked = False
 
-    @staticmethod
-    def add_callback(callback, key, args):
-        """ Add our callback to existing one.
+    def on_blocked(self, method):
+        """
+        Set connection blocking flag.
 
         Args:
-            callback: callback.
-            key: key.
-            args: arguments.
-        """
-        if key in args:
-            original_callback = args[key]
-
-            def call_hook(**kwargs):
-                callback(**kwargs)
-                original_callback(**kwargs)
-
-            args[key] = call_hook
-        else:
-            args[key] = callback
-
-    def block(self):
-        """
-        Set connection blocking flag
+            method: the method frame's `method` member is of type `pika.spec.Connection.Blocked`.
         """
         self._blocked = True
 
-    def unblock(self):
+    def on_unblocked(self, method):
         """
-        Unset connection blocking flag
+        Unset connection blocking flag.
+
+        Args:
+            method: the method frame's `method` member is of type `pika.spec.Connection.Unblocked`.
         """
         self._blocked = False
 
@@ -101,7 +87,7 @@ class RabbitMq(object):
     Library for working with RabbitMQ.
 
     == Dependencies ==
-    | amqp | https://pypi.python.org/pypi/amqp |
+    | pika | https://pypi.org/project/pika/ |
     | requests | https://pypi.python.org/pypi/requests |
     | robot framework | http://robotframework.org |
 
@@ -128,8 +114,8 @@ class RabbitMq(object):
         self._amqp_cache = ConnectionCache()
         self._channel = None
 
-    def _connect_to_amqp(self, host, port, username='guest', password='guest',
-                         alias=None, virtual_host='/'):
+    def _connect_to_amqp(self, host, port, username='guest', password='guest', alias=None, virtual_host='/',
+                         socket_timeout=15, heartbeat_timeout=600, blocked_timeout=300):
         """ Connect to server via AMQP.
 
         *Args*:\n
@@ -138,7 +124,10 @@ class RabbitMq(object):
             _username_: user name.\n
             _password_: user password.\n
             _alias_: connection alias.\n
-            _virtual_host_: virtual host name.\n
+            _virtual_host_: virtual host name;\n
+            _socket_timeout_: socket connect timeout;\n
+            _heartbeat_timeout_: AMQP heartbeat timeout negotiation during connection tuning;\n
+            _blocked_timeout_: timeout for the connection to remain blocked.\n
 
         *Returns:*\n
             Server connection object.
@@ -147,7 +136,6 @@ class RabbitMq(object):
         if port is None:
             BuiltIn().fail(msg="RabbitMq: port for connect is None")
         port = int(port)
-        timeout = 15
         if virtual_host is None:
             BuiltIn().fail(msg="RabbitMq: virtual host for connect is None")
         virtual_host = str(virtual_host)
@@ -156,19 +144,21 @@ class RabbitMq(object):
             host=host,
             port=port,
             username=username,
-            timeout=timeout,
+            timeout=socket_timeout,
             alias=alias)
 
         logger.debug('Connecting using : {params}'.format(params=parameters_for_connect))
-        hostname = "{host}:{port}".format(host=host, port=port)
+
+        credentials = pika.PlainCredentials(username=username, password=password)
+        conn_params = pika.ConnectionParameters(host=host, port=port,
+                                                credentials=credentials,
+                                                virtual_host=virtual_host,
+                                                socket_timeout=socket_timeout,
+                                                blocked_connection_timeout=blocked_timeout,
+                                                heartbeat=heartbeat_timeout)
         try:
-            self._amqp_connection = BlockedConnection(host=hostname,
-                                                      userid=username,
-                                                      password=password,
-                                                      connect_timeout=timeout,
-                                                      virtual_host=virtual_host,
-                                                      confirm_publish=True)
-        except (gaierror, error, IOError):
+            self._amqp_connection = BlockedConnection(parameters=conn_params)
+        except (gaierror, error, IOError, IncompatibleProtocolError):
             BuiltIn().fail(msg="RabbitMq: Could not connect with following parameters: {params}".format(
                 params=parameters_for_connect))
         self._channel = None
@@ -281,7 +271,7 @@ class RabbitMq(object):
         self._http_connection = None
         self._channel = None
         if self._amqp_connection is not None:
-            if self._amqp_connection.connected:
+            if self._amqp_connection.is_open:
                 self._amqp_connection.close()
             self._amqp_connection = None
 
@@ -349,7 +339,7 @@ class RabbitMq(object):
         logger.debug("Creating new exchange {ex} with type {t}"
                      .format(ex=exchange_name, t=exchange_type))
         self._get_channel().exchange_declare(exchange=exchange_name,
-                                             type=exchange_type,
+                                             exchange_type=exchange_type,
                                              durable=durable,
                                              auto_delete=auto_delete,
                                              arguments=arguments)
@@ -374,10 +364,10 @@ class RabbitMq(object):
         exchange_type = str(exchange_type)
         try:
             self._get_channel().exchange_declare(exchange=name,
-                                                 type=exchange_type,
+                                                 exchange_type=exchange_type,
                                                  passive=True)
             return True
-        except NotFound:
+        except ChannelClosed:
             return False
 
     def delete_exchange(self, exchange_name):
@@ -436,7 +426,7 @@ class RabbitMq(object):
         try:
             self._get_channel().queue_declare(queue=name, passive=True)
             return True
-        except NotFound:
+        except ChannelClosed:
             return False
 
     def binding_exchange_with_queue(self, exchange_name, queue_name,
@@ -535,18 +525,20 @@ class RabbitMq(object):
         queue_name = str(queue_name)
         consumer_name = "consumer{name}".format(name=queue_name)
 
-        def consumer_callback(message):
+        def consumer_callback(channel, method, properties, body):
             """
             Callback for consuming messages from the queue.
 
             Processes specified number of messages and closes.
 
             *Args:*\n
-            _message_ - message from the queue.
+                channel: BlockingChannel;
+                method: spec.Basic.Deliver;
+                properties: spec.BasicProperties;
+                body: str or unicode.
             """
-            channel = message.channel
-            tag = message.delivery_info['delivery_tag']
-            logger.debug("Consume message {} - {}".format(tag, message.body))
+            tag = method.delivery_tag
+            logger.debug("Consume message {} - {}".format(tag, body))
             channel.basic_reject(tag, requeue)
             consumed_list.append(tag)
             if len(consumed_list) >= count:
@@ -556,7 +548,7 @@ class RabbitMq(object):
                      .format(q=queue_name, c=count))
         self._get_channel().basic_consume(queue=queue_name,
                                           consumer_tag=consumer_name,
-                                          callback=consumer_callback)
+                                          consumer_callback=consumer_callback)
         return consumer_name
 
     def publish_message(self, exchange_name, routing_key, payload, props=None):
@@ -600,14 +592,13 @@ class RabbitMq(object):
         | Publish Message | exchange_name=testExchange | routing_key=testQueue | payload=message body | props=${prop_dict} |
         """
 
-        if props is None:
-            props = {}
+        if props is not None:
+            props = pika.BasicProperties(**props)
         exchange_name = str(exchange_name)
         routing_key = str(routing_key)
-        logger.debug('Publish message to {exc} with routing {r}'
-                     .format(exc=exchange_name, r=routing_key))
-        msg = Message(payload, **props)
-        self._get_channel().basic_publish(msg, exchange_name, routing_key)
+        logger.debug('Publish message to {exc} with routing {r}'.format(exc=exchange_name, r=routing_key))
+        self._get_channel().basic_publish(exchange=exchange_name, routing_key=routing_key,
+                                          body=payload, properties=props)
 
     def process_published_message_in_queries(self, waiting=1):
         """
@@ -619,10 +610,7 @@ class RabbitMq(object):
         """
 
         waiting = int(waiting)
-        try:
-            self._amqp_connection.drain_events(waiting)
-        except timeout:
-            pass
+        self._amqp_connection.process_data_events(time_limit=waiting)
 
     def enable_message_sending_confirmation(self, confirmed_list,
                                             activate=True):
@@ -642,20 +630,20 @@ class RabbitMq(object):
         | Length Should Be | ${list} | 1 |
         """
 
-        def confirm_callback(delivery_tag, multiple):
+        def confirm_callback(method):
             """
             Called when sending message notification is received.
             """
-            logger.debug('Capture confirm message with tag={tag}'
-                         .format(tag=delivery_tag))
+            delivery_tag = method.method.delivery_tag
+            logger.debug('Capture confirm message with tag={tag}'.format(tag=delivery_tag))
             confirmed_list.append(delivery_tag)
 
-        self._get_channel().confirm_select()
+        self._get_channel().confirm_delivery()
         logger.debug('Begin checking confirm publish')
         if activate is True:
-            self._get_channel().events['basic_ack'].add(confirm_callback)
-        else:
-            self._get_channel().events['basic_ack'].remove(confirm_callback)
+            self._get_channel()._impl.add_callback(callback=confirm_callback,
+                                                   replies=[pika.spec.Basic.Ack],
+                                                   one_shot=False)
 
     # Manager API
 
