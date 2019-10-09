@@ -1,19 +1,29 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- # noqa: E999
 
 import json
-import requests
+import logging
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from urllib.parse import quote
+
 import pika
+import requests
+from pika import BaseConnection
+from pika.adapters.blocking_connection import BlockingChannel
+from pika.connection import Parameters
+from pika.frame import Method as FrameMethod
+from pika.spec import Basic, BasicProperties, Connection
 from pika.exceptions import ChannelClosed, IncompatibleProtocolError
-from requests.utils import quote
 from robot.api import logger
 from robot.utils import ConnectionCache
-from socket import gaierror, error
 from robot.libraries.BuiltIn import BuiltIn
+from socket import gaierror, error
+
+RabbitMqMessage = Union[Tuple[Dict[str, Any], Dict[str, Any], str], Tuple[None, None, None]]  # noqa: 993
 
 
 class RequestConnection(object):
     """This class contains settings to connect to RabbitMQ via HTTP."""
-    def __init__(self, host, port, username, password, timeout):
+    def __init__(self, host: str, port: Union[int, str], username: str, password: str, timeout: int) -> None:
         """
         Initialization.
 
@@ -27,11 +37,11 @@ class RequestConnection(object):
         """
         self.host = host
         self.port = port
-        self.url = 'http://{host}:{port}/api'.format(host=host, port=port)
+        self.url = f'http://{host}:{port}/api'
         self.auth = (username, password)
         self.timeout = timeout
 
-    def close(self):
+    def close(self) -> None:
         """Close connection."""
         pass
 
@@ -41,8 +51,7 @@ class BlockedConnection(pika.BlockingConnection):
     Wrapper over standard connection to RabbitMQ
     Allows to register connection lock events of the server
     """
-
-    def __init__(self, parameters=None, impl_class=None):
+    def __init__(self, parameters: Parameters = None, impl_class: Type[BaseConnection] = None) -> None:
         """Constructor arguments are supplemented with
         callbacks to register blocking events
 
@@ -55,7 +64,7 @@ class BlockedConnection(pika.BlockingConnection):
         self.add_on_connection_unblocked_callback(self.on_unblocked)
         self._blocked = False
 
-    def on_blocked(self, method):
+    def on_blocked(self, method: Connection.Blocked) -> None:
         """
         Set connection blocking flag.
 
@@ -64,7 +73,7 @@ class BlockedConnection(pika.BlockingConnection):
         """
         self._blocked = True
 
-    def on_unblocked(self, method):
+    def on_unblocked(self, method: Connection.Unblocked) -> None:
         """
         Unset connection blocking flag.
 
@@ -74,12 +83,24 @@ class BlockedConnection(pika.BlockingConnection):
         self._blocked = False
 
     @property
-    def blocked(self):
+    def blocked(self) -> bool:
         """
         *Returns:*\n
             Connection blocking flag.
         """
         return self._blocked
+
+    def close(self, reply_code: int = 200, reply_text: str = 'Normal shutdown') -> None:
+        """Close AMQP connection.
+
+        Args:
+            reply_code: the code number for the close.
+            reply_text: the text reason for the close.
+        """
+        if self.is_open:
+            super().close(reply_code=reply_code, reply_text=reply_text)
+        else:
+            logger.debug("Connection is already closed.")
 
 
 class RabbitMq(object):
@@ -103,19 +124,48 @@ class RabbitMq(object):
     |    | Log Dictionary | ${overview} |
     |    | Close All Rabbitmq Connections |
     """
-
     ROBOT_LIBRARY_SCOPE = 'GLOBAL'
 
-    def __init__(self):
+    def __init__(self) -> None:
         """ Initialization. """
-        self._http_connection = None
+        self._http_connection: Optional[RequestConnection] = None
         self._http_cache = ConnectionCache()
-        self._amqp_connection = None
+        self._amqp_connection: Optional[BlockedConnection] = None
         self._amqp_cache = ConnectionCache()
-        self._channel = None
+        self._channel: Optional[BlockingChannel] = None
+        logging.getLogger("pika").setLevel(logging.WARNING)
 
-    def _connect_to_amqp(self, host, port, username='guest', password='guest', alias=None, virtual_host='/',
-                         socket_timeout=15, heartbeat_timeout=600, blocked_timeout=300):
+    @property
+    def http_connection(self) -> RequestConnection:
+        """Get current http connection to RabbitMQ.
+
+        *Raises:*\n
+            RuntimeError: if there isn't any open connection.
+
+        *Returns:*\n
+            Current http connection to to RabbitMQ.
+        """
+        if self._http_connection is None:
+            raise RuntimeError('There is no open http connection to RabbitMQ.')
+        return self._http_connection
+
+    @property
+    def amqp_connection(self) -> BlockedConnection:
+        """Get current ampq connection to RabbitMQ.
+
+        *Raises:*\n
+            RuntimeError: if there isn't any open connection.
+
+        *Returns:*\n
+            Current ampq connection to to RabbitMQ.
+        """
+        if self._amqp_connection is None:
+            raise RuntimeError('There is no open ampq connection to RabbitMQ.')
+        return self._amqp_connection
+
+    def _connect_to_amqp(self, host: str, port: Union[int, str], username: str = 'guest', password: str = 'guest',
+                         alias: str = None, virtual_host: str = '/', socket_timeout: int = 15,
+                         heartbeat_timeout: int = 600, blocked_timeout: int = 300) -> int:
         """ Connect to server via AMQP.
 
         *Args*:\n
@@ -130,9 +180,8 @@ class RabbitMq(object):
             _blocked_timeout_: timeout for the connection to remain blocked.\n
 
         *Returns:*\n
-            Server connection object.
+            Server connection index.
         """
-
         if port is None:
             BuiltIn().fail(msg="RabbitMq: port for connect is None")
         port = int(port)
@@ -140,14 +189,10 @@ class RabbitMq(object):
             BuiltIn().fail(msg="RabbitMq: virtual host for connect is None")
         virtual_host = str(virtual_host)
 
-        parameters_for_connect = "host={host}, port={port}, username={username}, timeout={timeout}, alias={alias}".format(
-            host=host,
-            port=port,
-            username=username,
-            timeout=socket_timeout,
-            alias=alias)
+        parameters_for_connect = \
+            f"host={host}, port={port}, username={username}, timeout={socket_timeout}, alias={alias}"
 
-        logger.debug('Connecting using : {params}'.format(params=parameters_for_connect))
+        logger.debug(f'Connecting using : {parameters_for_connect}')
 
         credentials = pika.PlainCredentials(username=username, password=password)
         conn_params = pika.ConnectionParameters(host=host, port=port,
@@ -159,12 +204,11 @@ class RabbitMq(object):
         try:
             self._amqp_connection = BlockedConnection(parameters=conn_params)
         except (gaierror, error, IOError, IncompatibleProtocolError):
-            BuiltIn().fail(msg="RabbitMq: Could not connect with following parameters: {params}".format(
-                params=parameters_for_connect))
+            BuiltIn().fail(msg=f"RabbitMq: Could not connect with following parameters: {parameters_for_connect}")
         self._channel = None
         return self._amqp_cache.register(self._amqp_connection, alias)
 
-    def _connect_to_http(self, host, port, username, password, alias):
+    def _connect_to_http(self, host: str, port: Union[int, str], username: str, password: str, alias: str) -> int:
         """ Connect to server via HTTP.
 
         *Args*:\n
@@ -175,29 +219,23 @@ class RabbitMq(object):
             _alias_: connection alias.\n
 
         *Returns:*\n
-            Server connection object.
+            Server connection index.
         """
         if port is None:
             BuiltIn().fail(msg="RabbitMq: port for connect is None")
         port = int(port)
         timeout = 15
-        parameters_for_connect = "host={host}, port={port}, username={username}, timeout={timeout}, alias={alias}".format(
-            host=host,
-            port=port,
-            username=username,
-            timeout=timeout,
-            alias=alias)
+        parameters_for_connect = f"host={host}, port={port}, username={username}, timeout={timeout}, alias={alias}"
 
         logger.debug('Connecting using : {params}'.format(params=parameters_for_connect))
         try:
             self._http_connection = RequestConnection(host, port, username, password, timeout)
         except (gaierror, error, IOError):
-            BuiltIn().fail(msg="RabbitMq: Could not connect with following parameters: {params}".format(
-                params=parameters_for_connect))
+            BuiltIn().fail(msg=f"RabbitMq: Could not connect with following parameters: {parameters_for_connect}")
         return self._http_cache.register(self._http_connection, alias)
 
-    def create_rabbitmq_connection(self, host, http_port, amqp_port, username,
-                                   password, alias, vhost):
+    def create_rabbitmq_connection(self, host: str, http_port: Union[int, str], amqp_port: Union[int, str],
+                                   username: str, password: str, alias: str, vhost: str) -> None:
         """
         Connect to RabbitMq server.
 
@@ -219,14 +257,11 @@ class RabbitMq(object):
         *Example:*\n
         | Create Rabbitmq Connection | my_host_name | 15672 | 5672 | guest | guest | alias=rmq | vhost=/ |
         """
-
-        self._connect_to_http(host=host, port=http_port, username=username,
-                              password=password, alias=alias + "_http")
-        self._connect_to_amqp(host=host, port=amqp_port, username=username,
-                              password=password, alias=alias + "_amqp",
+        self._connect_to_http(host=host, port=http_port, username=username, password=password, alias=alias + "_http")
+        self._connect_to_amqp(host=host, port=amqp_port, username=username, password=password, alias=alias + "_amqp",
                               virtual_host=vhost)
 
-    def switch_rabbitmq_connection(self, alias):
+    def switch_rabbitmq_connection(self, alias: str) -> int:
         """Switch between active RabbitMq connections using their index or alias.\n
 
         Alias is set in keyword [#Create Rabbitmq Connection|Create Rabbitmq Connection]
@@ -247,16 +282,14 @@ class RabbitMq(object):
         | ${live}= | Is alive |
         | Close All Rabbitmq Connections |
         """
-
         old_index = self._http_cache.current_index
-        logger.debug('Switch active connection from {old} to {new}'
-                     .format(old=old_index, new=alias))
+        logger.debug(f'Switch active connection from {old_index} to {alias}')
         self._http_connection = self._http_cache.switch(alias + '_http')
         self._amqp_connection = self._amqp_cache.switch(alias + '_amqp')
         self._channel = None
         return old_index
 
-    def disconnect_from_rabbitmq(self):
+    def disconnect_from_rabbitmq(self) -> None:
         """
         Close current RabbitMq connection.
 
@@ -264,10 +297,8 @@ class RabbitMq(object):
         | Create Rabbitmq Connection | my_host_name | 15672 | 5672 | guest | guest | alias=rmq |
         | Disconnect From Rabbitmq |
         """
-
-        logger.debug('Close connection with : host={host}, port={port}'.format(
-            host=self._http_connection.host, port=self._http_connection.port))
-        self._http_connection.close()
+        logger.debug(f'Close connection with : host={self.http_connection.host}, port={self.http_connection.port}')
+        self.http_connection.close()
         self._http_connection = None
         self._channel = None
         if self._amqp_connection is not None:
@@ -275,7 +306,7 @@ class RabbitMq(object):
                 self._amqp_connection.close()
             self._amqp_connection = None
 
-    def close_all_rabbitmq_connections(self):
+    def close_all_rabbitmq_connections(self) -> None:
         """
         Close all RabbitMq connections.
 
@@ -290,7 +321,6 @@ class RabbitMq(object):
         | Create Rabbitmq Connection | my_host_name | 15672 | 5672 | guest | guest | alias=rmq |
         | Close All Rabbitmq Connections |
         """
-
         self._http_cache.close_all()
         self._http_connection = None
         self._amqp_cache.close_all()
@@ -299,20 +329,20 @@ class RabbitMq(object):
 
     # AMQP API
 
-    def _get_channel(self):
+    def _get_channel(self) -> BlockingChannel:
         """ Get channel from current connection.
 
         *Returns:*\n
             Channel.
         """
         if self._channel is None:
-            self._channel = self._amqp_connection.channel()
-        if self._amqp_connection.blocked:
+            self._channel = self.amqp_connection.channel()
+        if self.amqp_connection.blocked:
             raise Exception('Connection is blocked')
         return self._channel
 
-    def create_exchange(self, exchange_name, exchange_type, auto_delete=None,
-                        durable=None, arguments=None):
+    def create_exchange(self, exchange_name: str, exchange_type: str, auto_delete: bool = False,
+                        durable: bool = False, arguments: Dict[str, Any] = None) -> None:
         """
         Create exchange.
 
@@ -333,18 +363,16 @@ class RabbitMq(object):
         | ${args}= | Create Dictionary | arg1=value1 | arg2=${list} | alternate-exchange=amq.fanout |
         | Create Exchange | exchange_name=testExchange | exchange_type=fanout | auto_delete=false | durable=true | arguments=${args} |
         """
-
         exchange_name = str(exchange_name)
         exchange_type = str(exchange_type)
-        logger.debug("Creating new exchange {ex} with type {t}"
-                     .format(ex=exchange_name, t=exchange_type))
+        logger.debug(f"Creating new exchange {exchange_name} with type {exchange_type}")
         self._get_channel().exchange_declare(exchange=exchange_name,
                                              exchange_type=exchange_type,
                                              durable=durable,
                                              auto_delete=auto_delete,
                                              arguments=arguments)
 
-    def is_exchange_exist(self, name, exchange_type):
+    def is_exchange_exist(self, name: str, exchange_type: str) -> bool:
         """
         Check if exchange exists
 
@@ -359,18 +387,15 @@ class RabbitMq(object):
         *Returns:*\n
         True if exchange exists otherwise False
         """
-
         name = str(name)
         exchange_type = str(exchange_type)
         try:
-            self._get_channel().exchange_declare(exchange=name,
-                                                 exchange_type=exchange_type,
-                                                 passive=True)
+            self._get_channel().exchange_declare(exchange=name, exchange_type=exchange_type, passive=True)
             return True
         except ChannelClosed:
             return False
 
-    def delete_exchange(self, exchange_name):
+    def delete_exchange(self, exchange_name: str) -> None:
         """
         Delete exchange.
 
@@ -380,12 +405,11 @@ class RabbitMq(object):
         *Example:*\n
         | Delete Exchange | exchange_name=testExchange |
         """
-
         exchange_name = str(exchange_name)
         self._get_channel().exchange_delete(exchange=exchange_name)
 
-    def create_queue(self, queue_name, auto_delete=None, durable=None,
-                     node=None, arguments=None):
+    def create_queue(self, queue_name: str, auto_delete: bool = False, durable: bool = False,
+                     node: str = None, arguments: Dict[str, Any] = None) -> None:
         """
         Create queue.
 
@@ -401,14 +425,12 @@ class RabbitMq(object):
         | ${args}= | Create Dictionary | arg1=value1 | arg2=${list} |
         | Create Queue | queue_name=testQueue | auto_delete=false | durable=true | node=rabbit@primary | arguments=${args} |
         """
-
         queue_name = str(queue_name)
         logger.debug('Create queue {n}'.format(n=queue_name))
-        self._get_channel().queue_declare(queue=queue_name, durable=durable,
-                                          auto_delete=auto_delete,
+        self._get_channel().queue_declare(queue=queue_name, durable=durable, auto_delete=auto_delete,
                                           arguments=arguments)
 
-    def is_queue_exist(self, name):
+    def is_queue_exist(self, name: str) -> bool:
         """
         Check if queue exists
 
@@ -422,15 +444,14 @@ class RabbitMq(object):
         *Returns:*\n
         True if queue exists otherwise False
         """
-
         try:
             self._get_channel().queue_declare(queue=name, passive=True)
             return True
         except ChannelClosed:
             return False
 
-    def binding_exchange_with_queue(self, exchange_name, queue_name,
-                                    routing_key='', arguments=None):
+    def binding_exchange_with_queue(self, exchange_name: str, queue_name: str, routing_key: str = '',
+                                    arguments: Dict[str, Any] = None) -> None:
         """
         Create binding of exchange with queue.
 
@@ -445,17 +466,14 @@ class RabbitMq(object):
         | ${args}= | Create Dictionary | arg1=value1 | arg2=${list} |
         | Binding Exchange With Queue | exchange_name=testExchange | queue_name=testQueue | routing_key=key | arguments=${args} |
         """
-
         queue_name = str(queue_name)
         exchange_name = str(exchange_name)
-        logger.debug('Binding queue {q} to exchange {e}, with routing key {r}'
-                     .format(q=queue_name, e=exchange_name, r=routing_key))
-        self._get_channel().queue_bind(queue=queue_name, exchange=exchange_name,
-                                       routing_key=routing_key,
+        logger.debug(f'Binding queue {queue_name} to exchange {exchange_name}, with routing key {routing_key}')
+        self._get_channel().queue_bind(queue=queue_name, exchange=exchange_name, routing_key=routing_key,
                                        arguments=arguments)
 
-    def unbind_queue(self, queue_name, exchange_name, routing_key='',
-                     arguments=None):
+    def unbind_queue(self, queue_name: str, exchange_name: str, routing_key: str = '',
+                     arguments: Dict[str, Any] = None) -> None:
         """
         Unbind queue from exchange.
 
@@ -465,29 +483,24 @@ class RabbitMq(object):
         _routing_key_ - routing key;\n
         _arguments_ - additional arguments in dictionary format;\n
         """
-
         queue_name = str(queue_name)
         exchange_name = str(exchange_name)
-        logger.debug('Unbind queue {q} from exchange {e} with routing key {r}'
-                     .format(q=queue_name, r=routing_key, e=exchange_name))
-        self._get_channel().queue_unbind(queue=queue_name,
-                                         exchange=exchange_name,
-                                         routing_key=routing_key,
+        logger.debug(f'Unbind queue {queue_name} from exchange {exchange_name} with routing key {routing_key}')
+        self._get_channel().queue_unbind(queue=queue_name, exchange=exchange_name, routing_key=routing_key,
                                          arguments=arguments)
 
-    def purge_queue(self, queue_name):
+    def purge_queue(self, queue_name: str) -> None:
         """
         Purge queue.
 
         *Args:*\n
         _queue_name_ - queue name;\n
         """
-
         queue_name = str(queue_name)
-        logger.debug('Purge queue {q}'.format(q=queue_name))
+        logger.debug(f'Purge queue {queue_name}')
         self._get_channel().queue_purge(queue=queue_name)
 
-    def delete_queue(self, queue_name):
+    def delete_queue(self, queue_name: str) -> None:
         """
         Delete queue.
 
@@ -497,12 +510,11 @@ class RabbitMq(object):
         *Example:*\n
         | Delete Queue | queue_name=testQueue |
         """
-
         queue_name = str(queue_name)
         self._get_channel().queue_delete(queue=queue_name)
 
-    def enable_consuming_messages_in_queue(self, queue_name, count, requeue,
-                                           consumed_list):
+    def enable_consuming_messages_in_queue(self, queue_name: str, count: int, requeue: bool,
+                                           consumed_list: List[int]) -> str:
         """
         Enable consuming messages in queue.
 
@@ -520,12 +532,12 @@ class RabbitMq(object):
         | Enable Consuming Messages In Queue | queue_name=${QUEUE_NAME} | count=1 | requeue=${FALSE} | consumed_list=${list} |
         | Log List | ${list} |
         """
-
         count = int(count)
         queue_name = str(queue_name)
-        consumer_name = "consumer{name}".format(name=queue_name)
+        consumer_name = f"consumer{queue_name}"
 
-        def consumer_callback(channel, method, properties, body):
+        def on_message_callback(channel: BlockingChannel, method: Basic.Deliver, properties: BasicProperties,
+                                body: bytes) -> None:
             """
             Callback for consuming messages from the queue.
 
@@ -535,23 +547,73 @@ class RabbitMq(object):
                 channel: BlockingChannel;
                 method: spec.Basic.Deliver;
                 properties: spec.BasicProperties;
-                body: str or unicode.
+                body: bytes.
             """
             tag = method.delivery_tag
-            logger.debug("Consume message {} - {}".format(tag, body))
+            logger.debug(f"Consume message {tag} - {body}")
             channel.basic_reject(tag, requeue)
             consumed_list.append(tag)
             if len(consumed_list) >= count:
                 channel.basic_cancel(consumer_name)
 
-        logger.debug('Begin consuming messages. Queue={q}, count={c}'
-                     .format(q=queue_name, c=count))
-        self._get_channel().basic_consume(queue=queue_name,
-                                          consumer_tag=consumer_name,
-                                          consumer_callback=consumer_callback)
+        logger.debug(f'Begin consuming messages. Queue={queue_name}, count={count}')
+        self._get_channel().basic_consume(queue=queue_name, consumer_tag=consumer_name,
+                                          on_message_callback=on_message_callback)
         return consumer_name
 
-    def publish_message(self, exchange_name, routing_key, payload, props=None):
+    def get_message_from_queue(self, queue_name: str, ack: bool = True) -> RabbitMqMessage:
+        """Getting single message from RabbitMQ queue.
+        Method gets first message from queue and acks it if ack=True.
+
+        *Args:*\n
+            queue_name: queue_name; \n
+            ack: ack message or not (default=True);\n
+
+        *Returns:*\n
+            delivery_data: delivery_data dictionary.
+            message_properties: message properties dictionary.
+            body: message body.
+            If queue is empty, returns None, None, None.
+
+        *Example:*\n
+        | Get Message From Queue | my_queue_name|
+        """
+        method, properties, body = self._get_channel().basic_get(
+            queue=queue_name)
+
+        if not (method and properties and body):
+            return None, None, None
+        else:
+            delivery_data = {
+                'delivery_tag': method.delivery_tag,
+                'redelivered': method.redelivered,
+                'exchange': method.exchange,
+                'routing_key': method.routing_key,
+                'message_count': method.message_count
+            }
+
+            message_properties = {
+                'content_type': properties.content_type,
+                'content_encoding': properties.content_encoding,
+                'headers': properties.headers,
+                'delivery_mode': properties.delivery_mode,
+                'priority': properties.priority,
+                'correlation_id': properties.correlation_id,
+                'reply_to': properties.reply_to,
+                'expiration': properties.expiration,
+                'message_id': properties.message_id,
+                'timestamp': properties.timestamp,
+                'type': properties.type,
+                'user_id': properties.user_id,
+                'app_id': properties.app_id,
+                'cluster_id': properties.cluster_id
+            }
+            if ack:
+                delivery_tag = delivery_data['delivery_tag']
+                self._get_channel().basic_ack(delivery_tag=delivery_tag)
+            return delivery_data, message_properties, body
+
+    def publish_message(self, exchange_name: str, routing_key: str, payload: str, props: Dict[str, Any] = None) -> None:
         """
         Publish message to the queue.
 
@@ -563,7 +625,7 @@ class RabbitMq(object):
          Includes such keys as:\n
         - _content-type_ - message content type (shortstr);
         - _content_encoding_ - message encoding type (shortstr);
-        - _application_headers_ - message headers table, a dictionary with keys of type string and values of types
+        - _headers_ - message headers table, a dictionary with keys of type string and values of types
          string | int | Decimal | datetime | dict values (table);
         - _delivery_mode_ - Non-persistent (1) or persistent (2) (octet);
         - _priority_ - message priority from 0 to 9 (octet);
@@ -591,16 +653,15 @@ class RabbitMq(object):
         | ${prop_dict}= | Create Dictionary | application_headers=${headers_dict} | content-type=text/plain | priority=1 | expiration=1410966000 | message_id=101 | user_id=guest |
         | Publish Message | exchange_name=testExchange | routing_key=testQueue | payload=message body | props=${prop_dict} |
         """
-
         if props is not None:
             props = pika.BasicProperties(**props)
         exchange_name = str(exchange_name)
         routing_key = str(routing_key)
-        logger.debug('Publish message to {exc} with routing {r}'.format(exc=exchange_name, r=routing_key))
+        logger.debug(f'Publish message to {exchange_name} with routing {routing_key}')
         self._get_channel().basic_publish(exchange=exchange_name, routing_key=routing_key,
                                           body=payload, properties=props)
 
-    def process_published_message_in_queries(self, waiting=1):
+    def process_published_message_in_queries(self, waiting: int = 1) -> None:
         """
         Send processing of published message in queues to handler.\n
         May end with exception if handler is not installed or there are no messages in queue.\n
@@ -608,12 +669,10 @@ class RabbitMq(object):
         *Args:*\n
         _waiting_ - server response timeout.
         """
-
         waiting = int(waiting)
-        self._amqp_connection.process_data_events(time_limit=waiting)
+        self.amqp_connection.process_data_events(time_limit=waiting)
 
-    def enable_message_sending_confirmation(self, confirmed_list,
-                                            activate=True):
+    def enable_message_sending_confirmation(self, confirmed_list: List[str], activate: bool = True) -> None:
         """
         Enable processing of successful message sending confirmation in the exchange servers.\n
         If message is successfully sent to confirmed_list, delivery_tag of the message is added.\n
@@ -629,13 +688,12 @@ class RabbitMq(object):
         | Process Published Message In Queries |
         | Length Should Be | ${list} | 1 |
         """
-
-        def confirm_callback(method):
+        def confirm_callback(method: FrameMethod) -> None:
             """
             Called when sending message notification is received.
             """
             delivery_tag = method.method.delivery_tag
-            logger.debug('Capture confirm message with tag={tag}'.format(tag=delivery_tag))
+            logger.debug(f'Capture confirm message with tag={delivery_tag}')
             confirmed_list.append(delivery_tag)
 
         self._get_channel().confirm_delivery()
@@ -648,7 +706,7 @@ class RabbitMq(object):
     # Manager API
 
     @staticmethod
-    def _prepare_request_headers(body=None):
+    def _prepare_request_headers(body: Dict[str, Any] = None) -> Dict[str, str]:
         """
         Headers definition for HTTP-request.
         Args:*\n
@@ -663,7 +721,7 @@ class RabbitMq(object):
         return headers
 
     @staticmethod
-    def _quote_vhost(vhost):
+    def _quote_vhost(vhost: str) -> str:
         """ Vhost quote.
 
         *Args:*\n
@@ -678,7 +736,7 @@ class RabbitMq(object):
             vhost = quote(vhost)
         return vhost
 
-    def is_alive(self):
+    def is_alive(self) -> bool:
         """
         Rabbitmq health check.
 
@@ -697,16 +755,16 @@ class RabbitMq(object):
         True
         """
         try:
-            response = requests.get(self._http_connection.url,
-                                    auth=self._http_connection.auth,
+            response = requests.get(self.http_connection.url,
+                                    auth=self.http_connection.auth,
                                     headers=self._prepare_request_headers(),
-                                    timeout=self._http_connection.timeout)
+                                    timeout=self.http_connection.timeout)
         except requests.exceptions.RequestException as e:
-            raise Exception('Could not send request: {0}'.format(e))
-        logger.debug('Response status={0}'.format(response.status_code))
+            raise Exception(f'Could not send request: {e}')
+        logger.debug(f'Response status={response.status_code}')
         return response.status_code == 200
 
-    def overview(self):
+    def overview(self) -> Dict[str, Any]:
         """ Information about RabbitMq server.
 
         *Returns:*\n
@@ -722,30 +780,30 @@ class RabbitMq(object):
         =>\n
         Dictionary size is 14 and it contains following items:
         | cluster_name | rabbit@primary |
-        | contexts | [{u'node': u'rabbit@primary', u'path': u'/', u'description': u'RabbitMQ Management', u'port': 15672}, {u'node': u'rabbit@primary', u'path': u'/web-stomp-examples', u'description': u'WEB-STOMP: examples', u'port': 15670}] |
+        | contexts | [{'node': 'rabbit@primary', 'path': '/', 'description': 'RabbitMQ Management', 'port': 15672}, {'node': 'rabbit@primary', 'path': '/web-stomp-examples', 'description': 'WEB-STOMP: examples', 'port': 15670}] |
         | erlang_full_version | Erlang R16B03 (erts-5.10.4) [source] [64-bit] [async-threads:30] [kernel-poll:true] |
         | erlang_version | R16B03 |
-        | exchange_types | [{u'enabled': True, u'name': u'fanout', u'description': u'AMQP fanout exchange, as per the AMQP specification'}, {u'internal_purpose': u'federation', u'enabled': True, u'name': u'x-federation-upstream', u'description': u'Federation upstream helper exchange'}, {u'enabled': True, u'name': u'direct', u'description': u'AMQP direct exchange, as per the AMQP specification'}, {u'enabled': True, u'name': u'headers', u'description': u'AMQP headers exchange, as per the AMQP specification'}, {u'enabled': True, u'name': u'topic', u'description': u'AMQP topic exchange, as per the AMQP specification'}, {u'enabled': True, u'name': u'x-consistent-hash', u'description': u'Consistent Hashing Exchange'}] |
-        | listeners | [{u'node': u'rabbit@primary', u'ip_address': u'::', u'protocol': u'amqp', u'port': 5672}, {u'node': u'rabbit@primary', u'ip_address': u'::', u'protocol': u'clustering', u'port': 25672}, {u'node': u'rabbit@primary', u'ip_address': u'::', u'protocol': u'mqtt', u'port': 1883}, {u'node': u'rabbit@primary', u'ip_address': u'::', u'protocol': u'stomp', u'port': 61613}] |
+        | exchange_types | [{'enabled': True, 'name': 'fanout', 'description': 'AMQP fanout exchange, as per the AMQP specification'}, {'internal_purpose': 'federation', 'enabled': True, 'name': 'x-federation-upstream', 'description': 'Federation upstream helper exchange'}, {'enabled': True, 'name': 'direct', 'description': 'AMQP direct exchange, as per the AMQP specification'}, {'enabled': True, 'name': 'headers', 'description': 'AMQP headers exchange, as per the AMQP specification'}, {'enabled': True, 'name': 'topic', 'description': 'AMQP topic exchange, as per the AMQP specification'}, {'enabled': True, 'name': 'x-consistent-hash', 'description': 'Consistent Hashing Exchange'}] |
+        | listeners | [{'node': 'rabbit@primary', 'ip_address': '::', 'protocol': 'amqp', 'port': 5672}, {'node': 'rabbit@primary', 'ip_address': '::', 'protocol': 'clustering', 'port': 25672}, {'node': 'rabbit@primary', 'ip_address': '::', 'protocol': 'mqtt', 'port': 1883}, {'node': 'rabbit@primary', 'ip_address': '::', 'protocol': 'stomp', 'port': 61613}] |
         | management_version | 3.3.0 |
-        | message_stats | {u'publish_details': {u'rate': 0.0}, u'confirm': 85, u'deliver_get': 85, u'publish': 85, u'confirm_details': {u'rate': 0.0}, u'get_no_ack': 85, u'get_no_ack_details': {u'rate': 0.0}, u'deliver_get_details': {u'rate': 0.0}} |
+        | message_stats | {'publish_details': {'rate': 0.0}, 'confirm': 85, 'deliver_get': 85, 'publish': 85, 'confirm_details': {'rate': 0.0}, 'get_no_ack': 85, 'get_no_ack_details': {'rate': 0.0}, 'deliver_get_details': {'rate': 0.0}} |
         | node | rabbit@primary |
-        | object_totals | {u'connections': 0, u'channels': 0, u'queues': 2, u'consumers': 0, u'exchanges': 10} |
-        | queue_totals | {u'messages_details': {u'rate': 0.0}, u'messages': 0, u'messages_ready': 0, u'messages_ready_details': {u'rate': 0.0}, u'messages_unacknowledged': 0, u'messages_unacknowledged_details': {u'rate': 0.0}} |
+        | object_totals | {'connections': 0, 'channels': 0, 'queues': 2, 'consumers': 0, 'exchanges': 10} |
+        | queue_totals | {'messages_details': {'rate': 0.0}, 'messages': 0, 'messages_ready': 0, 'messages_ready_details': {'rate': 0.0}, 'messages_unacknowledged': 0, 'messages_unacknowledged_details': {'rate': 0.0}} |
         | rabbitmq_version | 3.3.0 |
         | statistics_db_node | rabbit@primary |
         | statistics_level | fine |
 
         ${version} = 3.3.0
         """
-        url = self._http_connection.url + '/overview'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/overview'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def connections(self):
+    def connections(self) -> List[Dict[str, Any]]:
         """ List of open connections.
 
         *Returns:*\n
@@ -754,14 +812,14 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/connections'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/connections'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_name_of_all_connections(self):
+    def get_name_of_all_connections(self) -> List[str]:
         """ List with names of all open connections.
 
         *Returns:*\n
@@ -769,7 +827,7 @@ class RabbitMq(object):
         """
         return [item['name'] for item in self.connections()]
 
-    def channels(self):
+    def channels(self) -> List[Dict[str, Any]]:
         """ List of open channels.
 
         *Returns:*\n
@@ -777,14 +835,14 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/channels'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/channels'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_exchange(self, exchange_name, vhost='%2F'):
+    def get_exchange(self, exchange_name: str, vhost: str = '%2F') -> Dict[str, Any]:
         """ Get information about exchange.
         Parameters are quoted with requests.utils.quote.
 
@@ -817,16 +875,15 @@ class RabbitMq(object):
 
         ${value} = testExchange
         """
-        path = '/exchanges/{vhost}/{name}'.format(
-            vhost=self._quote_vhost(vhost), name=quote(exchange_name))
-        response = requests.get(self._http_connection.url + path,
-                                auth=self._http_connection.auth,
+        path = f'/exchanges/{self._quote_vhost(vhost)}/{quote(exchange_name)}'
+        response = requests.get(self.http_connection.url + path,
+                                auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def exchanges(self):
+    def exchanges(self) -> List[Dict[str, Any]]:
         """ List of exchanges.
 
         *Returns:*\n
@@ -842,20 +899,19 @@ class RabbitMq(object):
         | ${name}=  |  Get From Dictionary  |  ${q}  |  name  |
         =>\n
         List length is 8 and it contains following items:
-        | 0 | {u'name': u'', u'durable': True, u'vhost': u'/', u'internal': False, u'message_stats': [], u'arguments': {}, u'type': u'direct', u'auto_delete': False} |
-        | 1 | {u'name': u'amq.direct', u'durable': True, u'vhost': u'/', u'internal': False, u'message_stats': [], u'arguments': {}, u'type': u'direct', u'auto_delete': False} |
+        | 0 | {'name': '', 'durable': True, 'vhost': '/', 'internal': False, 'message_stats': [], 'arguments': {}, 'type': 'direct', 'auto_delete': False} |
+        | 1 | {'name': 'amq.direct', 'durable': True, 'vhost': '/', 'internal': False, 'message_stats': [], 'arguments': {}, 'type': 'direct', 'auto_delete': False} |
         ...\n
         ${name} = amq.direct
         """
-
-        url = self._http_connection.url + '/exchanges'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/exchanges'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_names_of_all_exchanges(self):
+    def get_names_of_all_exchanges(self) -> List[str]:
         """ List of names of all exchanges.
 
         *Returns:*\n
@@ -870,7 +926,7 @@ class RabbitMq(object):
         """
         return [item['name'] for item in self.exchanges()]
 
-    def get_exchanges_on_vhost(self, vhost='%2F'):
+    def get_exchanges_on_vhost(self, vhost: str = '%2F') -> List[Dict[str, Any]]:
         """ List of exchanges on virtual host.
 
         *Returns:*\n
@@ -882,15 +938,14 @@ class RabbitMq(object):
         *Args:*\n
         _vhost_ - virtual host name (quoted with requests.utils.quote);
         """
-
-        url = self._http_connection.url + '/exchanges/' + self._quote_vhost(vhost)
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/exchanges/' + self._quote_vhost(vhost)
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_names_of_exchanges_on_vhost(self, vhost='%2F'):
+    def get_names_of_exchanges_on_vhost(self, vhost: str = '%2F') -> List[str]:
         """List of exchanges names on virtual host.
 
         *Args:*\n
@@ -908,7 +963,7 @@ class RabbitMq(object):
         """
         return [item['name'] for item in self.get_exchanges_on_vhost(vhost)]
 
-    def get_queue(self, queue_name, vhost='%2F'):
+    def get_queue(self, queue_name: str, vhost: str = '%2F') -> Dict[str, Any]:
         """
         Get information about queue.
 
@@ -957,16 +1012,15 @@ class RabbitMq(object):
 
         ${value} = testQueue
         """
-        path = '/queues/{vhost}/{name}'.format(
-            vhost=self._quote_vhost(vhost), name=quote(queue_name))
-        response = requests.get(self._http_connection.url + path,
-                                auth=self._http_connection.auth,
+        path = f'/queues/{self._quote_vhost(vhost)}/{quote(queue_name)}'
+        response = requests.get(self.http_connection.url + path,
+                                auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def queues(self):
+    def queues(self) -> List[Dict[str, Any]]:
         """ List of queues.
 
         *Returns:*\n
@@ -975,14 +1029,14 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/queues'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/queues'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_queues_on_vhost(self, vhost='%2F'):
+    def get_queues_on_vhost(self, vhost: str = '%2F') -> List[Dict[str, Any]]:
         """ List of queues on virtual host.
 
         *Args:*\n
@@ -994,14 +1048,14 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/queues/' + self._quote_vhost(vhost)
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/queues/' + self._quote_vhost(vhost)
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_names_of_queues_on_vhost(self, vhost='%2F'):
+    def get_names_of_queues_on_vhost(self, vhost: str = '%2F') -> List[str]:
         """
         List of queues names on virtual host.
 
@@ -1020,8 +1074,8 @@ class RabbitMq(object):
         """
         return [item['name'] for item in self.get_queues_on_vhost(vhost)]
 
-    def get_binding_exchange_with_queue_list(self, exchange_name, queue_name,
-                                             vhost='%2F'):
+    def get_binding_exchange_with_queue_list(self, exchange_name: str, queue_name: str,
+                                             vhost: str = '%2F') -> List[Dict[str, Any]]:
         """
         Get information about bindings of exchange with queue.
 
@@ -1044,7 +1098,7 @@ class RabbitMq(object):
         | Log | ${bind[0]["vhost"]} |
         =>\n
         Dictionary size is 7 and it contains following items:
-        | arguments | {u'arg1': u'value1', u'arg2': [u'str1', False]} |
+        | arguments | {'arg1': 'value1', 'arg2': ['str1', False]} |
         | destination | testQueue |
         | destination_type | queue |
         | properties_key | ~2_oPmnDANCoVhkSJTkivZw |
@@ -1057,15 +1111,15 @@ class RabbitMq(object):
             exchange=quote(exchange_name),
             queue=quote(queue_name))
 
-        response = requests.get(self._http_connection.url + path,
-                                auth=self._http_connection.auth,
+        response = requests.get(self.http_connection.url + path,
+                                auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_message(self, queue_name, count, requeue, encoding, truncate=None,
-                    vhost='%2F', ackmode='ack_requeue_true'):
+    def get_message(self, queue_name: str, count: int, requeue: bool, encoding: str, truncate: int = None,
+                    vhost: str = '%2F', ackmode: str = 'ack_requeue_true') -> List[Dict[str, Any]]:
         """
         Get message from the queue.
 
@@ -1092,24 +1146,23 @@ class RabbitMq(object):
         | Log List | ${msg} |
         =>\n
         List length is 5 and it contains following items:
-        | 0 | {u'payload': u'message body 0', u'exchange': u'testExchange', u'routing_key': u'testQueue', u'payload_bytes': 14, u'message_count': 4, u'payload_encoding': u'string', u'redelivered': False, u'properties': []} |
-        | 1 | {u'payload': u'message body 1', u'exchange': u'testExchange', u'routing_key': u'testQueue', u'payload_bytes': 14, u'message_count': 3, u'payload_encoding': u'string', u'redelivered': False, u'properties': []} |
+        | 0 | {'payload': 'message body 0', 'exchange': 'testExchange', 'routing_key': 'testQueue', 'payload_bytes': 14, 'message_count': 4, 'payload_encoding': 'string', 'redelivered': False, 'properties': []} |
+        | 1 | {'payload': 'message body 1', 'exchange': 'testExchange', 'routing_key': 'testQueue', 'payload_bytes': 14, 'message_count': 3, 'payload_encoding': 'string', 'redelivered': False, 'properties': []} |
         | ... |
         """
-        path = '/queues/{vhost}/{name}/get'.format(
-            vhost=self._quote_vhost(vhost), name=quote(queue_name))
+        path = f'/queues/{self._quote_vhost(vhost)}/{quote(queue_name)}/get'
         body = {"count": count, "requeue": requeue, "encoding": encoding, "ackmode": ackmode}
         if truncate is not None:
             body["truncate"] = truncate
-        response = requests.post(self._http_connection.url + path,
-                                 auth=self._http_connection.auth,
+        response = requests.post(self.http_connection.url + path,
+                                 auth=self.http_connection.auth,
                                  headers=self._prepare_request_headers(body=body),
                                  data=json.dumps(body),
-                                 timeout=self._http_connection.timeout)
+                                 timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def vhosts(self):
+    def vhosts(self) -> List[Dict[str, Any]]:
         """ List of virtual hosts.
         *Returns:*\n
             List of virtual hosts in JSON format.
@@ -1117,14 +1170,14 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/vhosts'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/vhosts'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def nodes(self):
+    def nodes(self) -> List[Dict[str, Any]]:
         """ List of nodes.
 
         *Returns:*\n
@@ -1133,14 +1186,14 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/nodes'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/nodes'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
 
-    def _cluster_name(self):
+    def _cluster_name(self) -> List[Dict[str, Any]]:
         """ List of clusters.
 
         *Returns:*\n
@@ -1149,9 +1202,9 @@ class RabbitMq(object):
         *Raises:*\n
             raise HTTPError if the HTTP request returned an unsuccessful status code.
         """
-        url = self._http_connection.url + '/cluster-name'
-        response = requests.get(url, auth=self._http_connection.auth,
+        url = self.http_connection.url + '/cluster-name'
+        response = requests.get(url, auth=self.http_connection.auth,
                                 headers=self._prepare_request_headers(),
-                                timeout=self._http_connection.timeout)
+                                timeout=self.http_connection.timeout)
         response.raise_for_status()
         return response.json()
