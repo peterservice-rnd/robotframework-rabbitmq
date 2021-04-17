@@ -623,7 +623,7 @@ class RabbitMq(object):
         _payload_ - payload message;\n
         _props_ - additional arguments in dictionary format;\n
          Includes such keys as:\n
-        - _content-type_ - message content type (shortstr);
+        - _content_type_ - message content type (shortstr);
         - _content_encoding_ - message encoding type (shortstr);
         - _headers_ - message headers table, a dictionary with keys of type string and values of types
          string | int | Decimal | datetime | dict values (table);
@@ -650,7 +650,7 @@ class RabbitMq(object):
         *Example:*\n
         | ${list_headers}= | Create List | head_value | 2 | ${TRUE} |
         | ${headers_dict}= | Create Dictionary | head1=val1 | head2=${list_headers} |
-        | ${prop_dict}= | Create Dictionary | application_headers=${headers_dict} | content-type=text/plain | priority=1 | expiration=1410966000 | message_id=101 | user_id=guest |
+        | ${prop_dict}= | Create Dictionary | application_headers=${headers_dict} | content_type=text/plain | priority=1 | expiration=1410966000 | message_id=101 | user_id=guest |
         | Publish Message | exchange_name=testExchange | routing_key=testQueue | payload=message body | props=${prop_dict} |
         """
         if props is not None:
